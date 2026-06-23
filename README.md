@@ -1,6 +1,6 @@
 # Device Control Pipeline Simulator
 
-## 1. Setup and Run
+## Setup
 
 Requires Docker Desktop with Compose v2.23+.
 
@@ -8,76 +8,49 @@ Requires Docker Desktop with Compose v2.23+.
 docker compose up --build
 ```
 
-This starts mosquitto, three producers (bus-101, bus-102, bus-103), the consumer, and the sidecar. The consumer's health endpoint is at `localhost:8080/health`.
+Starts mosquitto, three producers (bus-101, bus-102, bus-103), the consumer, and the sidecar. Health endpoint is at `localhost:8080/health`.
 
 Unit tests (no Docker needed):
 ```bash
 python tests/test_validation.py
 ```
 
-**Fleet health demo:**
+**Quick smoke test:**
 ```bash
-# All three vehicles should show healthy after a few seconds
+# all three vehicles should be healthy within a few seconds
 curl -s localhost:8080/health
 
-# Stop one producer and wait for it to go stale
+# stop one producer and wait for it to go stale
 docker compose stop producer-bus-102
 sleep 6
 curl -s localhost:8080/health   # bus-102: stale, others: healthy
 
-# Sidecar resilience - queue grows while sidecar is down, drains when it comes back
+# test sidecar downtime -- queue builds up, drains when it comes back
 docker compose stop sidecar
-# ... wait a bit, watch consumer logs show backoff ...
+sleep 5
 docker compose start sidecar
 
-# Consumer restart - queue persists since it's on a named Docker volume
+# consumer restart -- queue survives on the named Docker volume
 docker compose restart consumer
-# consumer picks up where it left off, no messages lost
 ```
 
 ---
 
-## 2. Wire Protocol and Durability Design
+## Design Notes
 
-**Protocol: newline-delimited JSON.**
+**Queue:** I used SQLite on a named Docker volume instead of an in-memory structure so the queue survives consumer restarts. `INSERT OR IGNORE` on message `id` makes MQTT's at-least-once delivery safe -- duplicates silently do nothing. WAL mode (`PRAGMA journal_mode=WAL`) lets the health server read the DB while the TCP worker is writing, without them blocking each other.
 
-The consumer sends the raw message payload (already valid JSON) with a `\n` appended. The sidecar responds with one JSON object + `\n`. Both sides enforce a 64 KB max frame size.
+I did look at using a persistent MQTT session (QoS 1) to let the broker hold messages during downtime, but Mosquitto has `persistence false` in the provided config so that wouldn't actually work.
 
-I chose newline-delimited over a length-prefixed binary protocol because it keeps the stream human-readable and debuggable with `nc localhost 9000`. For messages that are pure UTF-8 JSON, there's no real advantage to binary framing. The consumer uses `socket.makefile('rb')` to read responses, which handles buffering internally so a single `recv()` call is never assumed to carry a complete line.
+**Wire format:** newline-delimited JSON over a persistent TCP connection. The main reason I picked this over a binary/length-prefixed format is that you can test the sidecar directly from a terminal with `nc localhost 9000`, which made debugging easier. The consumer uses `socket.makefile('rb')` so readline handles buffering internally.
 
-The consumer maintains a persistent TCP connection to the sidecar and only reconnects on error, redialling per message would be wasteful.
-
-**Durability: SQLite on a named Docker volume.**
-
-The queue schema is exactly what the spec requires, stored in `/data/pending.db` (mounted via `consumer-data:/data`). `INSERT OR IGNORE` keyed on the message `id` makes MQTT's at-least-once delivery idempotent. WAL mode (`PRAGMA journal_mode=WAL`) allows the HTTP health handler to read the DB without blocking the TCP worker's writes.
-
-I considered using a persistent MQTT session (QoS 1, `clean_session=False`) to let the broker hold messages during consumer downtime, but Mosquitto runs with `persistence false` in the provided config and would lose queued messages on restart. Owning the queue in the consumer is simpler to reason about.
-
-**Backoff:** `min(2**attempts, 30) + random.uniform(0, 1)`, giving 1s, 2s, 4s, 8s, 16s, 30s with up to 1s of jitter. The jitter matters at fleet scale: without it, hundreds of vehicles coming back online after a shared outage would all retry simultaneously.
+**Backoff:** `min(2**attempts, 30) + random.uniform(0, 1)` -- gives 1s, 2s, 4s, 8s, 16s, 30s. The jitter is important: without it every vehicle in the fleet would retry at the exact same second after a shared outage.
 
 ---
 
-## 3. Sidecar Metrics
+## Fleet Health (`GET /health`)
 
-Every 30 seconds the sidecar logs:
-
-```
-METRICS total=N malformed=N valid=N invalid=N avg_lat_ms=N max_lat_ms=N active_connections=N
-```
-
-- **total**: if this stops incrementing, the pipeline is broken end-to-end.
-- **malformed**: should always be 0 in normal operation. Non-zero means the consumer is sending invalid data or there's in-transit corruption.
-- **valid/invalid split**: with random inputs the ratio should be stable. A sudden change could indicate a validation bug.
-- **avg_lat_ms / max_lat_ms**: I track both because max is more actionable. A high max means some requests are consuming a significant chunk of the consumer's 3s timeout budget, which can cause spurious retries. Average alone hides this.
-- **active_connections**: normally 1. Zero means the consumer is down; more than one means a reconnect happened before the old connection was reaped.
-
-Things I'd add with more time: per-vehicle breakdown, latency histogram buckets, a Prometheus `/metrics` endpoint.
-
----
-
-## 4. Extension: Fleet Health Visibility
-
-I added a `GET /health` endpoint (stdlib `http.server`, no extra dependencies) on port 8080 that returns per-vehicle status:
+The spec mentioned ops needing to spot which vehicles are silently failing. The floor implementation already handles durability so the more useful addition seemed to be visibility.
 
 ```json
 {
@@ -87,38 +60,34 @@ I added a `GET /health` endpoint (stdlib `http.server`, no extra dependencies) o
 }
 ```
 
-The consumer tracks `last_seen[vehicle_id]` on every valid MQTT message and `error_count[vehicle_id]` each time a validation failure is published. A vehicle is marked stale if no message has been seen in more than 5 seconds (5x the 1s cadence; one missed beat could be scheduling noise, five in a row is a real signal).
+A vehicle is stale if nothing has been heard from it in over 5 seconds (5x the 1s publish cadence). The endpoint lives on the consumer rather than the sidecar because the consumer is the only component that sees traffic from every vehicle.
 
-**Why this direction:** the spec explicitly names fleet observability as the operational problem ("ops needs to be able to look at the fleet and quickly tell which vehicles are healthy and which are silently failing"). The floor implementation already addresses the reliability story (durable queue, retry with backoff). The remaining gap was visibility. Fleet health is also a useful hook for later; once `/health` exists, you can wire Prometheus scraping, alerting, and dashboards on top without touching the pipeline.
-
-**Tradeoffs:**
-- Health state is in-memory. Consumer restarts clear it; vehicles reappear after sending their next message.
-- `error_count` is cumulative since startup, not a rolling rate. Ops would rather see "errors in the last 5 minutes."
-- Single consumer is a SPOF for health monitoring. If the consumer is down, `/health` is too.
-
-**What's next:** persist `last_seen`/`error_count` to SQLite alongside the queue, expose a Prometheus `/metrics` endpoint, add per-vehicle query params, push alerts when a vehicle transitions to stale.
+A couple of known gaps: health state is in-memory and resets on consumer restart (vehicles reappear on their next message), and `error_count` is cumulative since startup rather than a rolling window.
 
 ---
 
-## 5. Known Limitations
+## Sidecar Metrics
 
-- **At-least-once delivery, not exactly-once.** If the consumer crashes after the sidecar responds but before `db_delete()` commits, the message is retried and a duplicate `control/error` may be published for the same id. This is a narrow window and acceptable here, but worth noting.
-- **No TLS on the consumer-sidecar socket.** The spec notes the network is unmanaged and hardware is physically accessible. mTLS would be mandatory in production. (TODO in `consumer.py` and `sidecar.py`.)
-- **No dead-letter table.** A message that consistently fails sidecar validation gets retried indefinitely with increasing backoff. A retry cap + quarantine table would be the fix. (TODO in `consumer.py`.)
-- **No real serial bridging.** The sidecar's TCP server stands in for whatever hardware protocol the real sidecar would speak (RS485, J1708, CAN bus). (TODO in `sidecar.py`.)
-- **Health state lost on consumer restart.** Covered in section 4.
-- **Malformed messages cause silent retries.** When the sidecar discards a message without responding, the consumer times out after 3s, backs off, and retries. If a message consistently fails sidecar validation but passes the consumer's envelope check (e.g. letters contains a digit, which the consumer doesn't check), it will retry forever. The dead-letter TODO above is the fix.
+Every 30 seconds the sidecar logs:
+```
+METRICS total=N malformed=N valid=N invalid=N avg_lat_ms=N max_lat_ms=N active_connections=N
+```
+
+I track both avg and max latency because a high max with a low avg means occasional slow requests eating into the consumer's 3s timeout budget. `active_connections` is normally 1 -- zero means the consumer is down.
 
 ---
 
-## 6. AI Tool Usage
+## Known Limitations
 
-I used Claude (claude-sonnet-4-6 via Claude Code) throughout.
+- **At-least-once, not exactly-once.** If the consumer crashes between the sidecar's response arriving and `db_delete()` committing, the message is retried and a duplicate `control/error` can be published for the same id. Narrow window, but worth knowing.
+- **No TLS on the consumer-sidecar socket.** Given the spec calls out an unmanaged network, mTLS would be mandatory in production. (TODO in both files.)
+- **No dead-letter handling.** A message that consistently fails sidecar validation just retries forever with increasing backoff. A retry cap and quarantine table would fix this.
+- **No real hardware bridging.** The sidecar's TCP server stands in for whatever the real protocol would be (RS485, CAN bus, etc.).
 
-**What the AI generated:** all Python code and the docker-compose changes. I described the spec requirements and design decisions, and Claude wrote the implementation. I reviewed each file for correctness against the spec, specifically: that `INSERT OR IGNORE` is used correctly for idempotency, that `valid=false` deletes the row (not retries), that `letter_sum` in the error payload comes from the sidecar response and is never recomputed locally, and that the `isinstance(number, bool)` guard is present (Python's `isinstance(True, int)` returns `True`, so without it `True` would pass the int check).
+---
 
-**What I decided:** the extension direction (fleet health over deeper reliability), the stale threshold and its reasoning, newline-delimited vs length-prefixed protocol, SQLite vs in-memory queue, where to put the health endpoint (consumer not sidecar, since the consumer is the one that sees all vehicle messages), and the overall architecture.
+## AI Usage
 
-**README:** Claude drafted the structure and prose; the reasoning sections reflect decisions I made during planning and I revised the content to make sure they're accurate.
-#   h o m e _ a s s e s s m e n t _ f r o m _ s w i f t l y  
- 
+I used Claude (claude-sonnet-4-6 via Claude Code) for all the Python code and docker-compose changes. I described the requirements and design decisions; Claude wrote the implementation. I reviewed each file against the spec -- the things I specifically checked were: `INSERT OR IGNORE` used correctly for idempotency, `valid=false` deletes the row rather than retrying, `letter_sum` in the error payload comes from the sidecar response and isn't recomputed locally, and the `isinstance(number, bool)` guard is present (since `isinstance(True, int)` returns `True` in Python, without it `True` would slip through as 1).
+
+The extension direction, the stale threshold, protocol choice, queue storage, where to put the health endpoint -- those were my decisions. Claude drafted this README and I revised it.
