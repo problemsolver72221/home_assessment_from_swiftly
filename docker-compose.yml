@@ -1,0 +1,109 @@
+# Requires Docker Compose v2.23+ (for inline `configs` support)
+# Check your version with: docker compose version
+
+services:
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    configs:
+      - source: mosquitto_conf
+        target: /mosquitto/config/mosquitto.conf
+
+  producer-bus-101:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        WORKDIR /app
+        RUN pip install --no-cache-dir paho-mqtt
+        COPY producer.py .
+        CMD ["python", "producer.py"]
+    depends_on:
+      - mosquitto
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      VEHICLE_ID: bus-101
+
+  producer-bus-102:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        WORKDIR /app
+        RUN pip install --no-cache-dir paho-mqtt
+        COPY producer.py .
+        CMD ["python", "producer.py"]
+    depends_on:
+      - mosquitto
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      VEHICLE_ID: bus-102
+
+  producer-bus-103:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        WORKDIR /app
+        RUN pip install --no-cache-dir paho-mqtt
+        COPY producer.py .
+        CMD ["python", "producer.py"]
+    depends_on:
+      - mosquitto
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      VEHICLE_ID: bus-103
+
+  consumer:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        WORKDIR /app
+        RUN pip install --no-cache-dir paho-mqtt
+        COPY consumer.py .
+        CMD ["python", "consumer.py"]
+    depends_on:
+      - mosquitto
+      - sidecar
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      SIDECAR_HOST: sidecar
+      SIDECAR_PORT: 9000
+      QUEUE_DB_PATH: /data/pending.db
+    volumes:
+      - consumer-data:/data
+    ports:
+      - "8080:8080"
+
+  sidecar:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        WORKDIR /app
+        COPY sidecar.py .
+        CMD ["python", "sidecar.py"]
+    ports:
+      - "9000:9000"
+    environment:
+      TCP_PORT: 9000
+
+volumes:
+  consumer-data:
+
+# The `configs` block lets you define file contents inline in docker-compose.yml
+# rather than needing a separate config file on disk.
+configs:
+  mosquitto_conf:
+    content: |
+      listener 1883
+      allow_anonymous true
+      persistence false
+      log_dest stdout

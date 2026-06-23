@@ -1,0 +1,21 @@
+HiLeo,
+
+Thanks for taking the time to chat with us. We enjoyed learning more about your background and wanted to share the next step in the process.
+
+We'd like to ask you to complete a short technical assessment. It's designed to reflect the kind of work that actually happens on our IoT team, so hopefully it feels relevant rather than abstract.
+
+What you'll be building
+
+The assessment asks you to implement a device control pipeline using Docker Compose. You'll write three Python scripts (a producer, a consumer, and a sidecar service) that work together to simulate how control messages flow from a cloud service, through a processing layer, and to a sidecar that validates them. An MQTT broker and the Docker Compose wiring are provided for you.
+
+The spec gives you a working floor, but we're more interested in seeing how you think beyond it. The real-world context we describe involves hardware on transit vehicles, intermittent connectivity, fleet-scale deployments, and protocols like CAN bus and J1708. We'd like you to pick one direction from that context that interests you and push on it thoughtfully. One extension explored with good reasoning matters more to us than a polished implementation that doesn't go anywhere.
+
+Time and format
+
+We expect this to take roughly 3 to 4 hours of focused work. If you run short on time, notes and comments explaining what you'd do next are completely welcome. Please include a README covering your setup instructions, design decisions, and a brief explanation of what you extended and why. AI tools are allowed and encouraged; just note how you used them.
+
+You'll find the full assignment files attached to this email. Please let me know if you have any trouble accessing them, and I'll get you sorted out. You have 5 business days from receipt of this email to submit your completed work.
+
+Looking forward to seeing what you build.
+
+Derek
